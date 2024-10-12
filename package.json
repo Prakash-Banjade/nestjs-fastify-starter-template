@@ -1,10 +1,18 @@
 {
-  "name": "fastify-nestjs",
-  "version": "0.0.1",
-  "description": "",
-  "author": "",
+  "name": "nestjs-fastify-starter-template",
+  "author": "Prakash Banjade",
+  "contributors": [
+    "Prakash Banjade (https://github.com/prakash-banjade)"
+  ],
+  "keywords": [
+    "nestjs",
+    "fastify",
+    "typescript",
+    "typeorm"
+  ],
+  "homepage": "https://github.com/Prakash-Banjade/nestjs-fastify-starter-template.git",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "MIT",
   "scripts": {
     "build": "nest build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
