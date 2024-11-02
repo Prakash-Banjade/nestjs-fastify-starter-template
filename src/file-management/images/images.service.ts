@@ -41,7 +41,7 @@ export class ImagesService {
 
     return {
       message: 'Image(s) Uploaded',
-      images: images.map(image => ({ id: image.id, url: image.url })),
+      files: images.map(image => ({ id: image.id, url: image.url, originalName: image.originalName })),
       count: createImageDto.images.length,
     }
   }
@@ -51,8 +51,8 @@ export class ImagesService {
 
     queryBuilder
       .orderBy('image.createdAt', 'DESC')
-      .skip(queryDto.skipPagination === 'true' ? undefined : queryDto.skip)
-      .take(queryDto.skipPagination === 'true' ? undefined : queryDto.take)
+      .skip(queryDto.skipPagination ? undefined : queryDto.skip)
+      .take(queryDto.skipPagination ? undefined : queryDto.take)
       .leftJoin('image.uploadedBy', 'uploadedBy')
       .where(new Brackets(qb => {
         currentUser.role !== Role.ADMIN && qb.where({ uploadedBy: { id: currentUser.accountId } })
@@ -65,20 +65,19 @@ export class ImagesService {
 
   async findAllByIds(ids: string[]) {
     return await this.imagesRepository.find({
-      where: {
-        id: In(ids)
-      }
+      where: [
+        { id: In(ids) },
+        { url: In(ids) }
+      ]
     })
   }
 
   async findOne(id: string, currentUser?: AuthUser) {
     const existingImage = await this.imagesRepository.findOne({
-      where: {
-        id,
-        uploadedBy: {
-          id: currentUser?.accountId
-        }
-      },
+      where: [
+        { id },
+        { url: id }
+      ],
     });
     if (!existingImage) throw new NotFoundException('Image not found');
 
@@ -88,11 +87,12 @@ export class ImagesService {
   async serveImage(filename: string, queryDto: ImageQueryDto, @Res() reply: FastifyReply) {
     const imagePath = path.join(process.cwd(), 'public', filename);
 
+    // If a thumbnail is requested
     if (queryDto.thumbnail === 'true') {
       const thumbnailPath = path.join(process.cwd(), 'public', filename.replace(/(\.[\w\d_-]+)$/i, '-thumbnail.webp'));
 
       try {
-        const thumbnailBuffer = await sharp(fs.readFileSync(thumbnailPath)).toBuffer();
+        const thumbnailBuffer = await sharp(thumbnailPath).toBuffer();
         reply.header('Content-Type', 'image/webp');
         reply.send(thumbnailBuffer);
         return;
@@ -104,32 +104,24 @@ export class ImagesService {
     }
 
     try {
-      // Create a readable stream from the image file
+      // Create a readable stream from the original image file
       const readStream = fs.createReadStream(imagePath);
 
       // Set the response header for the image type
       reply.header('Content-Type', 'image/webp');
 
-      // Use sharp to process the image
+      // Use sharp to transform the image and directly pipe it to reply
       const transform = sharp()
         .webp({ quality: isNaN(Number(queryDto.q)) ? 90 : parseInt(queryDto.q) })
         .resize(isNaN(Number(queryDto.w)) ? undefined : parseInt(queryDto.w));
 
-      // Pipe the read stream into the sharp transform, and then manually pipe chunks to the reply
-      readStream.pipe(transform).on('data', (chunk) => {
-        reply.raw.write(chunk);
-      });
-
-      // End the response once the stream has finished
-      transform.on('end', () => {
-        reply.raw.end();
-      });
+      // Pipe the read stream into the sharp transform, and then send it
+      reply.send(readStream.pipe(transform));
 
     } catch (err) {
       console.error('Original image not found:', err);
       reply.status(404).send('Original image not found');
     }
-
   }
 
   async update(id: string, updateImageDto: UpdateImageDto, currentUser: AuthUser) {
