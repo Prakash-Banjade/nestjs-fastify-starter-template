@@ -4,6 +4,7 @@ import { CaslAbilityFactory } from "../../auth-system/casl/casl-ability.factory/
 import { ForbiddenError } from "@casl/ability";
 import { AbilityRequiredRules, CHECK_ABILITY } from "../decorators/abilities.decorator";
 import { IS_PUBLIC_KEY } from "../decorators/setPublicRoute.decorator";
+import { FastifyRequest } from "fastify";
 
 @Injectable()
 export class AbilitiesGuard implements CanActivate {
@@ -17,20 +18,31 @@ export class AbilitiesGuard implements CanActivate {
             context.getHandler(),
             context.getClass(),
         ]);
-        const rules = this.reflector.get<AbilityRequiredRules[]>(CHECK_ABILITY, context.getHandler()) || []
+        const rules = this.reflector.get<AbilityRequiredRules[]>(CHECK_ABILITY, context.getHandler()) || [];
 
-        if (isPublic) return true; // no need to authorize public routes
+        if (isPublic) return true; // No need to authorize public routes
 
-        const { user } = context.switchToHttp().getRequest();
-        console.log(user)
+        const { user } = context.switchToHttp().getRequest<FastifyRequest>();
         const ability = this.caslAbility.defineAbility(user);
 
         try {
-            rules.forEach(rule => ForbiddenError.from(ability).throwUnlessCan(rule.action, rule.subject))
+            // Allow access if at least one rule is satisfied
+            const isAuthorized = rules.some((rule) => {
+                try {
+                    ForbiddenError.from(ability).throwUnlessCan(rule.action, rule.subject);
+                    return true; // If the rule is satisfied, allow access
+                } catch (e) {
+                    return false; // If this rule fails, check the next one
+                }
+            });
+
+            if (!isAuthorized) {
+                throw new ForbiddenException('Access Denied');
+            }
 
             return true;
         } catch (e) {
-            if (e instanceof ForbiddenError) throw new ForbiddenException(e.message)
+            if (e instanceof ForbiddenError) throw new ForbiddenException(e.message);
         }
     }
 }
