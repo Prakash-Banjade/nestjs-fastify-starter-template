@@ -7,10 +7,6 @@ export const userSelectCols: FindOptionsSelect<User> = {
     gender: true,
     phone: true,
     createdAt: true,
-    profileImage: {
-        id: true,
-        url: true,
-    },
     account: {
         firstName: true,
         lastName: true,

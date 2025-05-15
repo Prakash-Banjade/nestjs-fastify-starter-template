@@ -9,16 +9,13 @@ export class User extends BaseEntity {
     @Column({ type: 'varchar', nullable: true })
     phone: string | null;
 
-    @Column({ type: 'enum', enum: Gender, nullable: true })
+    @Column({ type: 'string', enum: Gender, nullable: true })
     gender: Gender | null;
 
     @Column({ type: 'timestamp', nullable: true })
     dob: string | null;
 
-    @OneToOne(() => Image, image => image.user_profileImage, { nullable: true })
+    @OneToOne(() => Account, account => account.user, { onDelete: 'CASCADE', nullable: false })
     @JoinColumn()
-    profileImage: Image | null;
-
-    @OneToOne(() => Account, account => account.user, { nullable: true })
-    account: Account | null;
+    account: Account;
 }

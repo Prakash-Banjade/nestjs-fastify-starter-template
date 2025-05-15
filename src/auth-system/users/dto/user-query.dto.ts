@@ -8,7 +8,7 @@ export class UsersQueryDto extends QueryDto {
     @IsOptional()
     phone?: string;
 
-    @ApiPropertyOptional({ type: 'enum', enum: Gender })
+    @ApiPropertyOptional({ type: 'string', enum: Gender })
     @IsOptional()
     gender?: Gender;
 
@@ -16,7 +16,7 @@ export class UsersQueryDto extends QueryDto {
     @IsOptional()
     dob?: string;
 
-    @ApiPropertyOptional({ type: 'enum', enum: Role })
+    @ApiPropertyOptional({ type: 'string', enum: Role })
     @IsOptional()
     role: Role
 }

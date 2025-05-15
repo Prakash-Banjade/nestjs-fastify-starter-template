@@ -1,9 +1,14 @@
 import { BeforeInsert, BeforeUpdate, Column, Entity, PrimaryGeneratedColumn } from "typeorm";
-import * as bcrypt from 'bcrypt'
+import * as bcrypt from 'bcrypt';
 import { PASSWORD_SALT_COUNT } from "src/common/CONSTANTS";
 
+export enum EOptVerificationType {
+    EMAIL_VERIFICATION = 'email-verification',
+    TWOFACTOR_VERIFICATION = 'twofactor-verification'
+}
+
 @Entity()
-export class EmailVerificationPending {
+export class OtpVerificationPending {
     @PrimaryGeneratedColumn('uuid')
     id: string;
 
@@ -13,11 +18,17 @@ export class EmailVerificationPending {
     @Column('varchar')
     hashedVerificationToken: string;
 
+    @Column({ type: 'string', enum: EOptVerificationType })
+    type: EOptVerificationType;
+
     @Column('varchar')
     otp: string;
 
     @Column('timestamp')
     createdAt: Date;
+
+    @Column({ type: 'text', nullable: true })
+    deviceId: string;
 
     @BeforeInsert()
     @BeforeUpdate()

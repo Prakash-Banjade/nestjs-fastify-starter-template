@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from './datasource/typeorm.module';
 import { AuthSystemModule } from './auth-system/auth-system.module';
 import { FileManagementModule } from './file-management/file-management.module';
@@ -10,12 +10,17 @@ import { MailModule } from './mail/mail.module';
 import { APP_GUARD } from '@nestjs/core';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { AuthGuard } from './common/guards/auth.guard';
+import { AbilitiesGuard } from './common/guards/abilities.guard';
+import { createKeyv } from '@keyv/redis';
+import { CacheModule } from '@nestjs/cache-manager';
+import { EnvModule } from './env/env.module';
+import { ScheduleModule } from '@nestjs/schedule';
+import { EventEmitterModule } from '@nestjs/event-emitter';
+import { CaslModule } from './auth-system/casl/casl.module';
 
 @Module({
   imports: [
-    ConfigModule.forRoot({
-      isGlobal: true,
-    }),
+    EnvModule,
     NestjsFormDataModule.config({
       storage: MemoryStoredFile,
       isGlobal: true,
@@ -31,6 +36,19 @@ import { AuthGuard } from './common/guards/auth.guard';
       ttl: 1000, // 5 req per second
       limit: 5,
     }]),
+    CacheModule.registerAsync({
+      imports: [ConfigModule],
+      isGlobal: true,
+      useFactory: async (configService: ConfigService) => {
+        return {
+          stores: [createKeyv(configService.getOrThrow('REDIS_URL'))],
+        };
+      },
+      inject: [ConfigService],
+    }),
+    CaslModule,
+    EventEmitterModule.forRoot(),
+    ScheduleModule.forRoot(),
     TypeOrmModule,
     AuthSystemModule,
     FileManagementModule,
@@ -46,6 +64,10 @@ import { AuthGuard } from './common/guards/auth.guard';
     {
       provide: APP_GUARD,
       useClass: AuthGuard, // global auth guard
+    },
+    {
+      provide: APP_GUARD,
+      useClass: AbilitiesGuard, // global ability guard
     },
   ],
 })

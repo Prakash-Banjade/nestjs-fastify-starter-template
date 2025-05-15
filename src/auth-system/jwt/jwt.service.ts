@@ -1,27 +1,22 @@
-import { CookieSerializeOptions } from '@fastify/csrf-protection';
 import { Injectable } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { JwtService as JwtSer } from '@nestjs/jwt';
-import { Tokens } from 'src/common/CONSTANTS';
 import { AuthUser } from 'src/common/types/global.type';
 import { Account } from '../accounts/entities/account.entity';
+import { FastifyRequest } from 'fastify';
+import { generateDeviceId } from 'src/common/utils';
+import { EnvService } from 'src/env/env.service';
 
 @Injectable()
 export class JwtService {
     constructor(
         private readonly jwtService: JwtSer,
-        private readonly configService: ConfigService,
+        private readonly envService: EnvService,
     ) { }
-
-    private readonly ACCESS_TOKEN_SECRET = this.configService.getOrThrow<string>('ACCESS_TOKEN_SECRET');
-    private readonly ACCESS_TOKEN_EXPIRATION_SEC = +this.configService.getOrThrow<number>('ACCESS_TOKEN_EXPIRATION_SEC');
-    private readonly REFRESH_TOKEN_SECRET = this.configService.getOrThrow<string>('REFRESH_TOKEN_SECRET');
-    private readonly REFRESH_TOKEN_EXPIRATION_SEC = +this.configService.getOrThrow<number>('REFRESH_TOKEN_EXPIRATION_SEC');
 
     async createAccessToken(payload: AuthUser): Promise<string> {
         return await this.jwtService.signAsync(payload, {
-            secret: this.ACCESS_TOKEN_SECRET,
-            expiresIn: this.ACCESS_TOKEN_EXPIRATION_SEC,
+            secret: this.envService.ACCESS_TOKEN_SECRET,
+            expiresIn: this.envService.ACCESS_TOKEN_EXPIRATION_SEC,
         });
     }
 
@@ -29,17 +24,33 @@ export class JwtService {
         return await this.jwtService.signAsync(
             { accountId: payload.accountId },
             {
-                secret: this.REFRESH_TOKEN_SECRET,
-                expiresIn: this.REFRESH_TOKEN_EXPIRATION_SEC,
+                secret: this.envService.REFRESH_TOKEN_SECRET,
+                expiresIn: this.envService.REFRESH_TOKEN_EXPIRATION_SEC,
             },
         );
     }
 
-    async getAuthTokens(account: Account) {
+    async getSudoAccessToken(accountId: string): Promise<string> {
+        return this.jwtService.signAsync(
+            { accountId },
+            {
+                secret: this.envService.SUDO_ACCESS_TOKEN_SECRET,
+                expiresIn: this.envService.SUDO_ACCESS_TOKEN_EXPIRATION_SEC,
+            }
+        );
+    }
+
+    async getAuthTokens(account: Account, req: FastifyRequest) {
+        const deviceId = generateDeviceId(req.headers['user-agent'], req.ip);
+
         const payload: AuthUser = {
+            firstName: account.firstName,
+            lastName: account.lastName,
+            profileImage: account.profileImage?.url,
             email: account.email,
             accountId: account.id,
             role: account.role,
+            deviceId,
         };
 
         const access_token = await this.createAccessToken(payload);

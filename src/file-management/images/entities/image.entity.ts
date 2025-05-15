@@ -1,7 +1,6 @@
 import { Account } from "src/auth-system/accounts/entities/account.entity";
-import { User } from "src/auth-system/users/entities/user.entity";
 import { BaseEntity } from "src/common/entities/base.entity";
-import { Column, Entity, ManyToOne, OneToOne } from "typeorm";
+import { Column, Entity, JoinColumn, ManyToOne, OneToOne } from "typeorm";
 
 @Entity()
 export class Image extends BaseEntity {
@@ -35,7 +34,13 @@ export class Image extends BaseEntity {
     @ManyToOne(() => Account, account => account.images, { onDelete: 'CASCADE' })
     uploadedBy!: Account
 
-    // relations
-    @OneToOne(() => User, user => user.profileImage)
-    user_profileImage: User;
+    /**
+    |--------------------------------------------------
+    | RELATIONS
+    |--------------------------------------------------
+    */
+
+    @OneToOne(() => Account, account => account.profileImage, { onDelete: 'CASCADE', nullable: true })
+    @JoinColumn()
+    account_profileImage: Account;
 }

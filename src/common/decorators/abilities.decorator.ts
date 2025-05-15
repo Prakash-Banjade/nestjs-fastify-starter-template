@@ -9,4 +9,4 @@ export interface AbilityRequiredRules {
 
 export const CHECK_ABILITY = 'check_ability'
 
-export const ChekcAbilities = (...requirements: AbilityRequiredRules[]) => SetMetadata(CHECK_ABILITY, requirements); 
+export const CheckAbilities = (...requirements: AbilityRequiredRules[]) => SetMetadata(CHECK_ABILITY, requirements); 

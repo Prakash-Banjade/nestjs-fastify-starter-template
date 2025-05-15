@@ -1,7 +1,11 @@
 export interface AuthUser {
+    firstName: string;
+    lastName: string;
+    profileImage: string | null;
     accountId: string;
     email: string;
     role: Role;
+    deviceId: string,
 }
 
 export enum Action {

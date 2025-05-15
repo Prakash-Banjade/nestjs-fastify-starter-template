@@ -1,197 +1,288 @@
-import {
-  BadRequestException,
-  ConflictException,
-  ForbiddenException,
-  HttpStatus,
-  Inject,
-  Injectable,
-  InternalServerErrorException,
-  NotFoundException,
-  Scope,
-  UnauthorizedException,
-} from '@nestjs/common';
-import { DataSource, Like } from 'typeorm';
+import { BadRequestException, ConflictException, ForbiddenException, HttpStatus, Inject, Injectable, InternalServerErrorException, NotFoundException, Scope, UnauthorizedException } from '@nestjs/common';
+import { DataSource, IsNull, Like, Not } from 'typeorm';
 import { PasswordChangeRequest } from './entities/password-change-request.entity';
-import { EmailVerificationPending } from './entities/email-verification-pending.entity';
 import { BaseRepository } from 'src/common/repository/base-repository';
 import { REQUEST } from '@nestjs/core';
 import { FastifyReply, FastifyRequest } from 'fastify';
 import { Account } from '../accounts/entities/account.entity';
-import { User } from '../users/entities/user.entity';
-import { ConfigService } from '@nestjs/config';
 import { AuthUser } from 'src/common/types/global.type';
-import { MAX_PREV_PASSWORDS, PASSWORD_SALT_COUNT, Tokens } from 'src/common/CONSTANTS';
-import { RegisterDto } from './dto/register.dto';
-import { SignInDto } from './dto/signIn.dto';
-import { MailService } from 'src/mail/mail.service';
+import { AuthMessage, MAX_PREV_PASSWORDS, PASSWORD_SALT_COUNT, Tokens } from 'src/common/CONSTANTS';
+import { RegisterDto, SignInDto } from './dto/signIn.dto';
+import { MailEvents, MailService } from 'src/mail/mail.service';
 import { AuthHelper } from './helpers/auth.helper';
 import { JwtService } from '../jwt/jwt.service';
-import { EmailVerificationDto } from './dto/email-verification.dto';
 import { CookieSerializeOptions } from '@fastify/cookie';
-import { ChangePasswordDto } from './dto/changePassword.dto';
 import * as bcrypt from 'bcrypt';
-import { ResetPasswordDto } from './dto/resetPassword.dto';
-import { UpdateEmailDto } from './dto/update-email.dto';
+import { generateDeviceId } from 'src/common/utils';
+import { LoginDevice } from '../accounts/entities/login-device.entity';
+import { WebAuthnCredential } from '../webAuthn/entities/webAuthnCredential.entity';
+import { EnvService } from 'src/env/env.service';
+import { RefreshTokenService } from './refresh-token.service';
+import { User } from '../users/entities/user.entity';
+import { EOptVerificationType, OtpVerificationPending } from './entities/otp-verification-pending.entity';
+import { ChangePasswordDto, OtpVerificationDto, ResetPasswordDto, UpdateEmailDto } from './dto/auth.dto';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import { TokenExpiredError } from '@nestjs/jwt';
+import { ResetPasswordMailEventDto } from 'src/mail/dto/mail-events.dto';
+import { IVerifyEncryptedHashTokenPairReturn } from './helpers/interface';
 
 @Injectable({ scope: Scope.REQUEST })
 export class AuthService extends BaseRepository {
   constructor(
-    private readonly datasource: DataSource,
-    @Inject(REQUEST) req: FastifyRequest,
+    datasource: DataSource, @Inject(REQUEST) req: FastifyRequest,
     private readonly jwtService: JwtService,
-    private readonly configService: ConfigService,
+    private readonly envService: EnvService,
     private readonly mailService: MailService,
     private readonly authHelper: AuthHelper,
+    private readonly eventEmitter: EventEmitter2,
+    private readonly refreshTokenService: RefreshTokenService,
   ) { super(datasource, req) }
 
-  private readonly accountsRepo = this.datasource.getRepository<Account>(Account)
-  private readonly usersRepo = this.datasource.getRepository<User>(User)
-  private readonly emailVerificationPendingRepo = this.datasource.getRepository<EmailVerificationPending>(EmailVerificationPending)
-  private readonly passwordChangeRequestRepo = this.datasource.getRepository<PasswordChangeRequest>(PasswordChangeRequest);
-
   async login(signInDto: SignInDto, req: FastifyRequest, reply: FastifyReply) {
-    const existingRefreshCookie = req.cookies?.[Tokens.REFRESH_TOKEN_COOKIE_NAME];
+    const data = await this.authHelper.validateAccount(signInDto.email, signInDto.password);
 
-    const foundAccount = await this.authHelper.validateAccount(signInDto.email, signInDto.password);
-    if (!foundAccount.isVerified) return await this.authHelper.sendConfirmationEmail(foundAccount);
+    if (!(data instanceof Account)) return data; // this can be a message after sending mail to unverified user
 
-    const { access_token, refresh_token } = await this.jwtService.getAuthTokens(foundAccount);
+    const foundAccount = data;
 
-    if (existingRefreshCookie) {
-      const { value: existingRefreshToken, valid } = req.unsignCookie(existingRefreshCookie);
+    return this.proceedLogin({ account: foundAccount, req, reply });
+  }
 
-      const newRefreshTokenArray = valid
-        ? (foundAccount?.refreshTokens?.filter((rt) => rt !== existingRefreshToken) ?? [])
-        : (foundAccount.refreshTokens ?? [])
-
-      if (existingRefreshToken) reply.clearCookie(Tokens.REFRESH_TOKEN_COOKIE_NAME, this.getRefreshCookieOptions()); // CLEAR COOKIE, BCZ A NEW ONE IS TO BE GENERATED
-
-      foundAccount.refreshTokens = [...newRefreshTokenArray];
+  async proceedLogin({
+    account, req, reply, checkDevice = true, method = 'password'
+  }: {
+    account: Account, req: FastifyRequest, reply: FastifyReply, checkDevice?: boolean, method?: 'password' | 'passkey'
+  }) {
+    if (checkDevice) {
+      const message = await this.handleDevice(account, req, method); // refreshtoken instance initialized here
+      if (message && 'message' in message) return message; // this can be first time login message
     }
 
-    foundAccount.refreshTokens = [...(foundAccount.refreshTokens ?? []), refresh_token];
+    const existingRefreshCookie = req.cookies?.[Tokens.REFRESH_TOKEN_COOKIE_NAME];
 
-    await this.accountsRepo.save(foundAccount);
+    const { access_token, refresh_token } = await this.jwtService.getAuthTokens(account, req);
+
+    // remove old refresh token from cookie
+    if (existingRefreshCookie) {
+      const { value: existingRefreshToken, valid } = req.unsignCookie(existingRefreshCookie);
+      if (existingRefreshToken && valid) reply.clearCookie(Tokens.REFRESH_TOKEN_COOKIE_NAME, this.getRefreshCookieOptions()); // CLEAR COOKIE, BCZ A NEW ONE IS TO BE GENERATED
+    }
+
+    await this.refreshTokenService.set(refresh_token); // set the new refresh_token to the redis cache
 
     return reply
       .setCookie(Tokens.REFRESH_TOKEN_COOKIE_NAME, refresh_token, this.getRefreshCookieOptions())
       .header('Content-Type', 'application/json')
       .send({
-        access_token,
+        access_token
       })
+  }
+
+  async handleDevice(account: Account, req: FastifyRequest, method: 'password' | 'passkey' = 'password') {
+    const userAgent = req.headers['user-agent'];
+    const ipAddress = req.ip;
+    const deviceId = generateDeviceId(userAgent, ipAddress);
+    const now = new Date();
+
+    const loginDevice = await this.getRepository(LoginDevice).findOne({
+      where: {
+        deviceId,
+        account: { id: account.id },
+        isTrusted: true,
+      },
+      select: { id: true },
+    });
+
+    if (!loginDevice) {
+      if (!!account.twoFaEnabledAt && method === 'password') {  // 2fa is enabled, so require 2fa verification else add the device to db
+        const webAuthn = await this.getRepository(WebAuthnCredential).findOne({
+          where: { account: { id: account.id } },
+          select: { id: true }
+        });
+
+        return ({
+          message: AuthMessage.DEVICE_NOT_FOUND,
+          hasPasskey: !!webAuthn,
+        })
+      }
+
+      await this.getRepository(LoginDevice).save({
+        account,
+        deviceId,
+        firstLogin: now,
+        lastActivityRecord: now,
+        lastLogin: now,
+        ua: userAgent,
+        isTrusted: true
+      });
+
+    } else {
+      loginDevice.lastLogin = now;
+      loginDevice.lastActivityRecord = now;
+      await this.getRepository(LoginDevice).save(loginDevice);
+    }
+
+    this.refreshTokenService.init({ email: account.email, deviceId }); // initialize the refresh token instance from here to provide the email and device
   }
 
   private getRefreshCookieOptions(): CookieSerializeOptions {
     return {
-      secure: this.configService.get('NODE_ENV') === 'production',
+      secure: this.envService.NODE_ENV === 'production',
       httpOnly: true,
       signed: true,
-      sameSite: this.configService.get('NODE_ENV') === 'production' ? 'none' : 'lax',
-      expires: new Date(Date.now() + (parseInt(this.configService.getOrThrow('REFRESH_TOKEN_EXPIRATION_SEC')) * 1000)),
+      sameSite: this.envService.NODE_ENV === 'production' ? 'none' : 'lax',
+      expires: new Date(Date.now() + (this.envService.REFRESH_TOKEN_EXPIRATION_SEC * 1000)),
       path: '/', // necessary to be able to access cookie from out of this route path context, like auth.guard.ts
     }
   }
 
-  async verifyEmail(emailVerificationDto: EmailVerificationDto) {
-    const foundRequest = await this.authHelper.verifyEmail(emailVerificationDto);
-
-    // GET ACCOUNT FROM DATABASE
-    const foundAccount = await this.accountsRepo.findOneBy({ email: foundRequest.email });
-    if (!foundAccount) throw new NotFoundException('Account not found');
-
-    foundAccount.isVerified = true;
-    const savedAccount = await this.accountsRepo.save(foundAccount);
-
-    const newUser = this.usersRepo.create({
-      account: savedAccount,
+  async verifyEmail(otpVerificationDto: OtpVerificationDto, req: FastifyRequest) {
+    const foundRequest = await this.authHelper.verifyPendingOtp({
+      otpVerificationDto,
+      type: EOptVerificationType.EMAIL_VERIFICATION,
     });
 
-    await this.usersRepo.save(newUser);
+    // GET ACCOUNT FROM DATABASE
+    const foundAccount = await this.getRepository(Account).findOne({
+      where: { email: foundRequest.email },
+      select: { id: true, email: true, firstName: true, lastName: true }
+    });
+    if (!foundAccount) throw new NotFoundException('Account not found');
 
-    await this.emailVerificationPendingRepo.remove(foundRequest); // remove from db
+    foundAccount.verifiedAt = new Date();
+    await this.getRepository(Account).save(foundAccount);
 
-    return {
-      message: 'Account verified successfully',
-      account: {
-        email: savedAccount.email,
-        name: savedAccount.firstName + ' ' + savedAccount.lastName,
-      },
+    await this.getRepository(OtpVerificationPending).remove(foundRequest); // remove from db
+
+    // add login device // TODO: might need to check for existing with same deviceId
+    await this.getRepository(LoginDevice).save({
+      account: foundAccount,
+      deviceId: generateDeviceId(req.headers['user-agent'], req.ip),
+      firstLogin: new Date(),
+      lastLogin: new Date(),
+      lastActivityRecord: new Date(),
+      ua: req.headers['user-agent'],
+      isTrusted: true
+    });
+
+    return { message: 'Account verified successfully' };
+  }
+
+  async verifyEmailResetToken(verificationToken: string) {
+    const result = await this.authHelper.verifyEncryptedHashTokenPair<{ email: string }>(verificationToken, this.envService.EMAIL_VERIFICATION_SECRET);
+    if (result?.error || !result?.payload?.email) {
+      if (result.error instanceof TokenExpiredError) throw new BadRequestException('OTP has been expired');
+      throw new BadRequestException(result.error?.message || 'Invalid token');
     };
+
+    return { message: "VALID TOKEN" };
   }
 
   async register(registerDto: RegisterDto) {
-    const foundAccount = await this.accountsRepo.findOneBy({
+    const foundAccount = await this.getRepository(Account).findOneBy({
       email: registerDto.email,
     });
 
-    if (foundAccount && foundAccount.isVerified) throw new ConflictException('User with this email already exists');
+    if (foundAccount) throw new ConflictException('Duplicate email');
 
     // handle if the account is not verified
-    if (foundAccount && !foundAccount.isVerified) {
+    if (!foundAccount.verifiedAt) {
       Object.assign(foundAccount, {
         ...registerDto,
       })
 
-      await this.accountsRepo.save(foundAccount);
+      await this.getRepository(Account).save(foundAccount);
 
-      return await this.authHelper.sendConfirmationEmail(foundAccount);
+      // return await this.authHelper.sendConfirmationEmail(foundAccount);
     }
 
     // create new account
-    const newAccount = this.accountsRepo.create(registerDto);
-    await this.accountsRepo.save(newAccount);
+    const newAccount = this.getRepository(Account).create(registerDto);
+    await this.getRepository(Account).save(newAccount);
 
-    return await this.authHelper.sendConfirmationEmail(newAccount);
+    // return await this.authHelper.sendConfirmationEmail(newAccount);
   }
 
   async refresh(req: FastifyRequest, reply: FastifyReply) {
-    reply.clearCookie(Tokens.REFRESH_TOKEN_COOKIE_NAME, this.getRefreshCookieOptions()); // a new refresh token is to be generated
-    const oldRefreshToken = req.unsignCookie(req.cookies[Tokens.REFRESH_TOKEN_COOKIE_NAME])?.value;
+    const { value: existingCookie, valid } = req.unsignCookie(req.cookies?.[Tokens.REFRESH_TOKEN_COOKIE_NAME]);
+    if (!valid) throw new UnauthorizedException('Invalid refresh token');
 
-    const account = await this.accountsRepo.findOneBy({ id: req.accountId, refreshTokens: Like(`%${oldRefreshToken}%`) }); // accountId is validated in the refresh token guard
+    reply.clearCookie(Tokens.REFRESH_TOKEN_COOKIE_NAME, this.getRefreshCookieOptions()); // a new refresh token is to be generated
+
+    const account = await this.getRepository(Account).findOne({
+      where: { id: req.accountId },
+      relations: { profileImage: true },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        profileImage: { url: true },
+      },
+    }); // accountId is validated in the refresh token guard
     if (!account) throw new UnauthorizedException('Invalid refresh token');
 
-    const { access_token, refresh_token } = await this.jwtService.getAuthTokens(account);
+    const deviceId = generateDeviceId(req.headers['user-agent'], req.ip);
+    this.refreshTokenService.init({ email: account.email, deviceId });
 
-    const newRefreshTokenArray = account.refreshTokens?.filter((rt) => rt !== oldRefreshToken);
-    account.refreshTokens = [...newRefreshTokenArray, refresh_token];
+    // check if refreshtoken exists
+    const rtPayload = await this.refreshTokenService.get(); // refreshToken Payload
+    if (!rtPayload || (rtPayload && rtPayload.refreshToken !== existingCookie)) throw new UnauthorizedException('Invalid refresh token');
 
-    await this.accountsRepo.save(account);
+    // update the last activity record of the device
+    const device = await this.getRepository(LoginDevice).findOne({
+      where: { deviceId, account: { id: account.id } },
+      select: { id: true },
+    });
+    if (!device) throw new UnauthorizedException('Unrecognized device'); // TODO: better to send mail to the user about unrecognized login or take some other action
+
+    await this.getRepository(LoginDevice).update(device.id, { lastActivityRecord: new Date() });
+
+    // set new refresh_token
+    const { access_token, refresh_token } = await this.jwtService.getAuthTokens(account, req);
+    await this.refreshTokenService.set(refresh_token); // set the new refresh_token to the redis cache for the current device
 
     return reply
       .setCookie(Tokens.REFRESH_TOKEN_COOKIE_NAME, refresh_token, this.getRefreshCookieOptions())
       .header('Content-Type', 'application/json')
-      .send({
-        access_token,
-      })
+      .send({ access_token })
   }
 
-  async logout(req: FastifyRequest, reply: FastifyReply) {
-    const refreshToken = req.unsignCookie(req.cookies[Tokens.REFRESH_TOKEN_COOKIE_NAME])?.value; // validated from refreshtoken guard
-
-    const account = await this.accountsRepo.findOneBy({ id: req.accountId, refreshTokens: Like(`%${refreshToken}%`) });
-    if (!account) throw new UnauthorizedException('Invalid refresh token');
-
-    const newRefreshTokenArray = account.refreshTokens?.filter((rt) => rt !== refreshToken);
-    account.refreshTokens = newRefreshTokenArray;
-
-    await this.accountsRepo.save(account);
+  async logout(reply: FastifyReply) {
+    this.refreshTokenService.init({});
+    this.refreshTokenService.remove(); // remove the current token from redis cache
 
     return reply.clearCookie(Tokens.REFRESH_TOKEN_COOKIE_NAME, this.getRefreshCookieOptions()).status(HttpStatus.NO_CONTENT).send();
   }
 
   async changePassword(changePasswordDto: ChangePasswordDto, currentUser: AuthUser) {
-    const account = await this.authHelper.validateAccount(currentUser.email, changePasswordDto.oldPassword);
-    if (!account.isVerified) throw new ForbiddenException();
+    const account = await this.getRepository(Account).findOne({
+      where: { id: currentUser.accountId, verifiedAt: Not(IsNull()) },
+      select: { id: true, password: true, prevPasswords: true, passwordUpdatedAt: true, verifiedAt: true }
+    });
+    if (!account) throw new InternalServerErrorException('Associated account not found');
 
-    // check if the new password is
+    // check if the current password is correct
+    const isPasswordMatch = await bcrypt.compare(changePasswordDto.currentPassword, account.password);
+    if (!isPasswordMatch) throw new BadRequestException({
+      message: 'Invalid password',
+      field: 'currentPassword'
+    });
+
+    // check if the new password is one of the last MAX_PREV_PASSWORDS passwords
     for (const prevPassword of account.prevPasswords) {
       const isMatch = await bcrypt.compare(changePasswordDto.newPassword, prevPassword);
-      if (isMatch) throw new ForbiddenException(`New password cannot be one of the last ${MAX_PREV_PASSWORDS} passwords`)
+      if (isMatch) throw new ForbiddenException({
+        message: `New password cannot be one of the last ${MAX_PREV_PASSWORDS} passwords`,
+        field: 'newPassword'
+      });
     }
 
-    account.password = changePasswordDto.newPassword;
-    account.prevPasswords.push(bcrypt.hashSync(changePasswordDto.newPassword, PASSWORD_SALT_COUNT));
+    const hashedPwd = bcrypt.hashSync(changePasswordDto.newPassword, PASSWORD_SALT_COUNT);
+
+    account.password = hashedPwd;
+    account.prevPasswords.push(hashedPwd);
     account.passwordUpdatedAt = new Date();
 
     // maintain prev passwords of size MAX_PREV_PASSWORDS
@@ -199,72 +290,93 @@ export class AuthService extends BaseRepository {
       account.prevPasswords.shift(); // remove the oldest one, index [0]
     }
 
-    await this.accountsRepo.save(account);
+    await this.getRepository(Account).update({ id: account.id }, account);
 
-    return {
-      message: "Password changed"
+    if (changePasswordDto.logout) {
+      this.refreshTokenService.init({});
+      await this.refreshTokenService.removeAll();
     }
+
+    return { message: "Password changed" }
   }
 
   async forgotPassword(email: string) {
-    const foundAccount = await this.accountsRepo.findOneBy({ email });
-    if (!foundAccount) throw new NotFoundException('Account not found');
+    const foundAccount = await this.getRepository(Account).findOne({
+      where: { email, verifiedAt: Not(IsNull()) },
+      select: { id: true, email: true, firstName: true, lastName: true },
+    });
+    if (!foundAccount) throw new NotFoundException({
+      message: "Invalid email. No account exist.",
+      field: "email"
+    });
 
     const [resetToken, hashedResetToken] = await this.authHelper.getEncryptedHashTokenPair(
       { email: foundAccount.email },
-      this.configService.getOrThrow('FORGOT_PASSWORD_SECRET'),
-      this.configService.getOrThrow('FORGOT_PASSWORD_EXPIRATION_SEC')
+      this.envService.FORGOT_PASSWORD_SECRET,
+      this.envService.FORGOT_PASSWORD_EXPIRATION_SEC
     )
 
     // existing request
     let changeRequest: PasswordChangeRequest;
-    const existingRequest = await this.passwordChangeRequestRepo.findOneBy({ email });
+    const existingRequest = await this.getRepository(PasswordChangeRequest).findOne({ where: { email }, select: { id: true } });
     if (existingRequest) {
       existingRequest.hashedResetToken = hashedResetToken;
       changeRequest = existingRequest;
     } else {
-      const passwordChangeRequest = this.passwordChangeRequestRepo.create({
+      const passwordChangeRequest = this.getRepository(PasswordChangeRequest).create({
         email: foundAccount.email,
         hashedResetToken,
       });
       changeRequest = passwordChangeRequest;
     }
 
-    await this.passwordChangeRequestRepo.save(changeRequest);
+    await this.getRepository(PasswordChangeRequest).save(changeRequest);
 
-    // send reset password link
-    await this.mailService.sendResetPasswordLink(foundAccount, resetToken);
+    // send reset password link mail
+    this.eventEmitter.emit(MailEvents.RESET_PASSWORD, new ResetPasswordMailEventDto({
+      receiverEmail: foundAccount.email,
+      receiverName: `${foundAccount.firstName} ${foundAccount.lastName}`,
+      token: resetToken
+    }));
 
     return {
-      message: `Token is valid for ${Number(this.configService.getOrThrow('FORGOT_PASSWORD_EXPIRATION_SEC')) / 60} minutes`,
+      message: `Link is valid for ${this.envService.FORGOT_PASSWORD_EXPIRATION_SEC / 60} minutes`,
     };
+  }
+
+  /**
+   * This service is also used in a controller, so frontend can verify the token before allowing for the reset password request
+   */
+  async verifyResetToken(providedResetToken: string, data = false) {
+    // hash the provided token to check in database
+    const result = await this.authHelper.verifyEncryptedHashTokenPair<{ email: string }>(providedResetToken, this.envService.FORGOT_PASSWORD_SECRET);
+    if (result?.error || !result?.payload?.email) {
+      // Todo: if token is not valid, remove the password change request from the database
+      if (result.error instanceof TokenExpiredError) throw new BadRequestException('Link has been expired');
+      throw new BadRequestException(result.error?.message || 'Invalid reset token');
+    };
+
+    return data ? result : { message: "VALID TOKEN" };
   }
 
   async resetPassword(resetPasswordDto: ResetPasswordDto) {
     const { token: providedResetToken, password } = resetPasswordDto;
 
-    // hash the provided token to check in database
-    const result = await this.authHelper.verifyEncryptedHashTokenPair<{ email: string }>(providedResetToken, this.configService.getOrThrow('FORGOT_PASSWORD_SECRET'));
-    if (!result || !result?.payload || !result?.tokenHash || !result?.payload?.email) throw new BadRequestException('Invalid reset token');
-
+    const result = (await this.verifyResetToken(providedResetToken, true)) as IVerifyEncryptedHashTokenPairReturn<{ email: string }>;
     const { payload, tokenHash } = result;
 
     // Retrieve the hashed reset token from the database
-    const passwordChangeRequest = await this.passwordChangeRequestRepo.findOneBy({ hashedResetToken: tokenHash, email: payload.email });
+    const passwordChangeRequest = await this.getRepository(PasswordChangeRequest).findOneBy({ hashedResetToken: tokenHash, email: payload.email });
 
-    if (!passwordChangeRequest) throw new NotFoundException('Invalid reset token');
+    if (!passwordChangeRequest) throw new NotFoundException('Invalid request');
 
-    // Check if the reset token has expired
-    const now = new Date();
-    const resetTokenExpiration = new Date(passwordChangeRequest.createdAt);
-    resetTokenExpiration.setSeconds(resetTokenExpiration.getSeconds() + parseInt(this.configService.getOrThrow('FORGOT_PASSWORD_EXPIRATION_SEC')));
-    if (now > resetTokenExpiration) {
-      await this.passwordChangeRequestRepo.remove(passwordChangeRequest);
-      throw new BadRequestException('Reset token has expired');
-    }
+    // Check if the reset token has expired # JWT WILL VERIFY THE EXPIRATION
 
     // retrieve the user from the database
-    const account = await this.accountsRepo.findOneBy({ email: passwordChangeRequest.email });
+    const account = await this.getRepository(Account).findOne({
+      where: { email: passwordChangeRequest.email },
+      select: { id: true, email: true, prevPasswords: true, verifiedAt: true }
+    });
     if (!account) throw new InternalServerErrorException('The requested Account was not available in the database.');
 
     // check if the new password is one of the last MAX_PREV_PASSWORDS passwords
@@ -273,8 +385,10 @@ export class AuthService extends BaseRepository {
       if (isMatch) throw new ForbiddenException(`New password cannot be one of the last ${MAX_PREV_PASSWORDS} passwords`)
     }
 
-    account.password = password;
-    account.prevPasswords.push(bcrypt.hashSync(password, PASSWORD_SALT_COUNT));
+    const hashedPwd = bcrypt.hashSync(password, PASSWORD_SALT_COUNT);
+
+    account.password = hashedPwd;
+    account.prevPasswords.push(hashedPwd);
     account.passwordUpdatedAt = new Date();
 
     // maintain prev passwords of size MAX_PREV_PASSWORDS
@@ -282,17 +396,24 @@ export class AuthService extends BaseRepository {
       account.prevPasswords.shift(); // remove the oldest one, index [0]
     }
 
-    await this.accountsRepo.save(account);
+    await this.getRepository(Account).save(account);
 
     // clear the reset token from the database
-    await this.passwordChangeRequestRepo.remove(passwordChangeRequest);
+    await this.getRepository(PasswordChangeRequest).remove(passwordChangeRequest);
+
+    // logout of all devices
+    this.refreshTokenService.init({ email: account.email });
+    await this.refreshTokenService.removeAll();
 
     // Return success response
     return { message: 'Password reset successful' };
   }
 
   async updateEmail(updateEmailDto: UpdateEmailDto, currentUser: AuthUser) {
-    const account = await this.accountsRepo.findOneBy({ id: currentUser.accountId });
+    const account = await this.getRepository(Account).findOne({
+      where: { id: currentUser.accountId },
+      select: { id: true, password: true, verifiedAt: true }
+    });
     if (!account) throw new InternalServerErrorException('Unable to update the associated profile. Please contact support.');
 
     const isPasswordMatch = await bcrypt.compare(updateEmailDto.password, account.password);
@@ -300,10 +421,8 @@ export class AuthService extends BaseRepository {
 
     account.email = updateEmailDto.newEmail;
 
-    await this.accountsRepo.save(account);
+    await this.getRepository(Account).save(account);
 
-    return {
-      message: 'Email updated'
-    }
+    return { message: 'Email updated' }
   }
 }

@@ -1,50 +1,39 @@
-import { Controller, Get, Post, Body, Patch, Param, Delete, Query, Res } from '@nestjs/common';
-import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
+import { Controller, Get, Post, Body, Param, Res } from '@nestjs/common';
+import { ApiBearerAuth, ApiConsumes, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { FormDataRequest } from 'nestjs-form-data';
 import { CreateFileDto } from './dto/create-files.dto';
 import { FilesService } from './files.service';
-import { UpdateFileDto } from './dto/update-files.dto';
-import { QueryDto } from 'src/common/dto/query.dto';
 import { FastifyReply } from 'fastify';
 import { Public } from 'src/common/decorators/setPublicRoute.decorator';
+import { CheckAbilities } from 'src/common/decorators/abilities.decorator';
+import { Action, Role } from 'src/common/types/global.type';
+import { SkipThrottle, Throttle } from '@nestjs/throttler';
 
-@ApiBearerAuth()
-@ApiTags('Upload Files')
+@ApiTags('Files')
 @Controller('upload/files')
 export class FilesController {
   constructor(private readonly filesService: FilesService) { }
 
-  @Post()
-  @FormDataRequest({ limits: { fileSize: 5 * 1024 * 1024, files: 10 } })
+  @ApiOperation({ description: 'Upload Files. Multiple files can be uploaded', summary: 'Upload File' })
+  @ApiResponse({ status: 201, description: 'Files uploaded successfully' })
+  @ApiResponse({ status: 400, description: 'Bad Request. Something is wrong with payload.' })
+  @FormDataRequest()
   @ApiConsumes('multipart/formdata')
+  @CheckAbilities({ action: Action.CREATE, subject: Role.USER })
+  @ApiBearerAuth()
+  @Post()
+  @Throttle({ default: { limit: 1, ttl: 1 * 1000 } }) // upload one file per second
   upload(@Body() createFileDto: CreateFileDto) {
     return this.filesService.upload(createFileDto);
   }
 
-  @Get()
-  findAll(@Query() queryDto: QueryDto) {
-    return this.filesService.findAll(queryDto);
-  }
-
+  @ApiOperation({ description: 'Get file by slug', summary: 'Get File' })
+  @ApiResponse({ status: 200, description: 'File fetched successfully' })
+  @ApiResponse({ status: 404, description: 'File not found' })
+  @SkipThrottle()
+  @Public()
   @Get('get-file/:slug')
-  @Public() // TODO: this should not be public
   getFile(@Param("slug") slug: string, @Res() res: FastifyReply) {
     return this.filesService.serveFile(slug, res);
-  }
-
-  // @Get(':id')
-  // findOne(@Param('id') id: string, @Res() res: Response) {
-  //   return this.filesService.findOne(id);
-  // }
-
-  @Patch(':id')
-  @FormDataRequest()
-  update(@Param('id') id: string, @Body() updateFileDto: UpdateFileDto) {
-    return this.filesService.update(id, updateFileDto);
-  }
-
-  @Delete(':id')
-  remove(@Param('id') id: string) {
-    return this.filesService.remove(id);
   }
 }

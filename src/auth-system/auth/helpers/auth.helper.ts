@@ -1,33 +1,38 @@
-import { BadRequestException, Inject, Injectable, NotFoundException, Scope, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, Inject, Injectable, Scope, UnauthorizedException } from "@nestjs/common";
 import { Account } from "src/auth-system/accounts/entities/account.entity";
-import { MailService } from "src/mail/mail.service";
 import { generateOtp } from "src/utils/generateOPT";
 import * as crypto from 'crypto'
 import { BaseRepository } from "src/common/repository/base-repository";
-import { DataSource } from "typeorm";
-import { FastifyRequest } from "fastify";
+import { DataSource, IsNull, Not } from "typeorm";
+import { FastifyReply, FastifyRequest } from "fastify";
 import { REQUEST } from "@nestjs/core";
-import { EmailVerificationPending } from "../entities/email-verification-pending.entity";
-import { JwtService } from "@nestjs/jwt";
-import { ConfigService } from "@nestjs/config";
-import { EmailVerificationDto } from "../dto/email-verification.dto";
+import { JwtService as JwtSer, TokenExpiredError } from "@nestjs/jwt";
 import * as bcrypt from 'bcrypt';
 import { EncryptionService } from "src/auth-system/encryption/encryption.service";
+import { AuthMessage, Tokens } from "src/common/CONSTANTS";
+import { EventEmitter2 } from "@nestjs/event-emitter";
+import { MailEvents } from "src/mail/mail.service";
+import { EnvService } from "src/env/env.service";
+import { JwtService } from "src/auth-system/jwt/jwt.service";
+import { EOptVerificationType, OtpVerificationPending } from "../entities/otp-verification-pending.entity";
+import { ConfirmationMailEventDto } from "src/mail/dto/mail-events.dto";
+import { OtpVerificationDto } from "../dto/auth.dto";
+import { IVerifyEncryptedHashTokenPairReturn } from "./interface";
+import { AuthUser } from "src/common/types/global.type";
 
 @Injectable({ scope: Scope.REQUEST })
 export class AuthHelper extends BaseRepository {
     constructor(
         private readonly datasource: DataSource,
         @Inject(REQUEST) req: FastifyRequest,
-        private readonly mailService: MailService,
-        private readonly jwtService: JwtService,
-        private readonly configService: ConfigService,
+        private readonly jwtService: JwtSer,
+        private readonly myJwtService: JwtService,
+        private readonly envService: EnvService,
         private readonly encryptionService: EncryptionService,
-    ) {
-        super(datasource, req);
-    }
+        private readonly eventEmitter: EventEmitter2,
+    ) { super(datasource, req) }
 
-    private readonly emailVerificationPendingRepo = this.datasource.getRepository<EmailVerificationPending>(EmailVerificationPending)
+    private readonly otpVerificationPendingRepo = this.datasource.getRepository(OtpVerificationPending)
     private readonly accountsRepo = this.datasource.getRepository<Account>(Account);
 
     /**
@@ -39,13 +44,15 @@ export class AuthHelper extends BaseRepository {
      * 4. Save the hashed token in db
      * 5. Send the encrypted token to the user's email
      */
-    async sendConfirmationEmail(account: Account) {
+    async generateOtp(account: Account, type: EOptVerificationType, deviceId: string = null) {
+        const otpSecret = this.getOtpSecrets(type);
+
         const otp = generateOtp();
         const verificationToken = await this.jwtService.signAsync(
             { email: account.email },
             {
-                secret: this.configService.getOrThrow('EMAIL_VERIFICATION_SECRET'),
-                expiresIn: parseInt(this.configService.getOrThrow('EMAIL_VERIFICATION_EXPIRATION_SEC')),
+                secret: otpSecret.secret,
+                expiresIn: otpSecret.expiration,
             }
         );
 
@@ -56,47 +63,72 @@ export class AuthHelper extends BaseRepository {
             .update(encryptedVerificationToken)
             .digest('hex');
 
-        // check for existing verification pending, if yes, remove
-        const existingVerificationRequest = await this.emailVerificationPendingRepo.findOneBy({ email: account.email });
+        // delete existing if any
+        await this.otpVerificationPendingRepo.delete({ email: account.email, type });
 
-        if (existingVerificationRequest) { // update the existing one
-            Object.assign(existingVerificationRequest, {
-                otp: String(otp),  // opt is saved as hash in db, logic is implemented in email-verification-pending.entity.ts
-                hashedVerificationToken,
-            })
+        const otpVerificationPending = this.otpVerificationPendingRepo.create({
+            email: account.email,
+            otp: String(otp),
+            hashedVerificationToken,
+            type,
+            deviceId
+        });
+        await this.otpVerificationPendingRepo.save(otpVerificationPending);
+        return { otp, encryptedVerificationToken };
 
-            await this.emailVerificationPendingRepo.save(existingVerificationRequest);
-        } else { // create new one
-            const emailVerificationPending = this.emailVerificationPendingRepo.create({
-                email: account.email,
-                otp: String(otp),
-                hashedVerificationToken,
-            });
-            await this.emailVerificationPendingRepo.save(emailVerificationPending);
-        }
+    }
 
-        await this.mailService.sendConfirmationEmail(account, encryptedVerificationToken, otp);
+    async sendEmailConfirmation(account: Account) {
+        const { otp, encryptedVerificationToken } = await this.generateOtp(account, EOptVerificationType.EMAIL_VERIFICATION);
+
+        // send mail
+        this.eventEmitter.emit(MailEvents.CONFIRMATION, new ConfirmationMailEventDto({
+            otp,
+            expirationMin: this.envService.EMAIL_VERIFICATION_EXPIRATION_SEC / 60,
+            receiverEmail: account.email,
+            receiverName: account.firstName + ' ' + account.lastName,
+            token: encryptedVerificationToken
+        }));
 
         return {
             message: "An OTP has been sent to your email. Please use the OTP to verify your account."
         }
     }
 
-    async verifyEmail(emailVerificationDto: EmailVerificationDto): Promise<EmailVerificationPending> {
-        const { otp, verificationToken } = emailVerificationDto;
+    async verifyPendingOtp({
+        otpVerificationDto,
+        type,
+        deviceId = null,
+    }: {
+        otpVerificationDto: OtpVerificationDto,
+        type: EOptVerificationType,
+        deviceId?: string;
+    }): Promise<OtpVerificationPending> {
+        const { otp, verificationToken } = otpVerificationDto;
+        const otpSecret = this.getOtpSecrets(type);
 
         let payload: { email: string };
         try {
             const decryptedToken = this.encryptionService.decrypt(verificationToken);
             // verify jwt token
             payload = await this.jwtService.verifyAsync(decryptedToken, {
-                secret: this.configService.get('EMAIL_VERIFICATION_SECRET'),
+                secret: otpSecret.secret, // get the secret based on type
             });
-        } catch {
-            throw new BadRequestException('Invalid token received')
+        } catch (e) {
+            if (e instanceof TokenExpiredError) throw new BadRequestException({
+                error: AuthMessage.TOKEN_EXPIRED,
+                message: 'OTP has been expired'
+            });
+            throw new BadRequestException('Invalid token');
         }
 
-        const foundRequest = await this.emailVerificationPendingRepo.findOneBy({ email: payload.email })
+        const foundRequest = await this.otpVerificationPendingRepo.findOneBy({
+            email: payload.email,
+            type,
+            deviceId
+        });
+
+        if (!foundRequest) throw new BadRequestException('Invalid token received');
 
         const verificationTokenHash = crypto
             .createHash('sha256')
@@ -110,34 +142,46 @@ export class AuthHelper extends BaseRepository {
         const isOtpValid = bcrypt.compareSync(String(otp), foundRequest.otp);
         if (!isOtpValid) throw new BadRequestException('Invalid OTP');
 
-        // check if otp has expired
-        const now = new Date();
-        const otpExpiration = new Date(foundRequest.createdAt);
-        otpExpiration.setSeconds(otpExpiration.getSeconds() + this.configService.getOrThrow('EMAIL_VERIFICATION_EXPIRATION_SEC'));
-        if (now > otpExpiration) {
-            await this.emailVerificationPendingRepo.remove(foundRequest); // remove from database
-            throw new BadRequestException('OTP has expired');
-        }
-
         return foundRequest;
     }
 
-    /**
-     * Returns Account object if credentials are valid
-     * 
-     * Note: Doesn't check if the account is verified
-     */
-    async validateAccount(email: string, password: string): Promise<Account> {
-        const foundAccount = await this.accountsRepo.findOneBy({ email });
+    getOtpSecrets(type: EOptVerificationType) {
+        const otpVerificationSecrets: Record<EOptVerificationType, { secret: string, expiration: number }> = {
+            [EOptVerificationType.EMAIL_VERIFICATION]: {
+                secret: this.envService.EMAIL_VERIFICATION_SECRET,
+                expiration: this.envService.EMAIL_VERIFICATION_EXPIRATION_SEC
+            },
+            [EOptVerificationType.TWOFACTOR_VERIFICATION]: {
+                secret: this.envService.TWOFACTOR_VERIFICATION_SECRET,
+                expiration: this.envService.TWOFACTOR_VERIFICATION_EXPIRATION_SEC
+            },
+        };
 
-        if (!foundAccount) throw new UnauthorizedException('Invalid email. Proceed to sign up.');
+        return otpVerificationSecrets[type];
+    }
+
+    /**
+     * Returns Account object if credentials are valid. 
+     * If account is not verified, send confirmation email
+     */
+    async validateAccount(email: string, password: string): Promise<Account | { message: string }> {
+        const foundAccount = await this.accountsRepo.findOne({
+            where: { email },
+            relations: { profileImage: true },
+            select: { profileImage: { url: true } },
+        });
+
+        if (!foundAccount) throw new UnauthorizedException(AuthMessage.INVALID_AUTH_CREDENTIALS);
+
+        // if account is not verified, send confirmation email
+        if (!foundAccount.verifiedAt) return await this.sendEmailConfirmation(foundAccount);
 
         const isPasswordValid = await bcrypt.compare(
             password,
             foundAccount.password,
         );
 
-        if (!isPasswordValid) throw new UnauthorizedException('Invalid password')
+        if (!isPasswordValid) throw new UnauthorizedException(AuthMessage.INVALID_AUTH_CREDENTIALS)
 
         return foundAccount;
     }
@@ -151,8 +195,8 @@ export class AuthHelper extends BaseRepository {
         const token = await this.jwtService.signAsync(
             payload,
             {
-                secret: this.configService.getOrThrow('EMAIL_VERIFICATION_SECRET'),
-                expiresIn: parseInt(this.configService.getOrThrow('EMAIL_VERIFICATION_EXPIRATION_SEC')),
+                secret,
+                expiresIn: expiration,
             }
         );
 
@@ -166,7 +210,7 @@ export class AuthHelper extends BaseRepository {
         return [encryptedToken, hashedToken];
     }
 
-    async verifyEncryptedHashTokenPair<T>(encryptedToken: string, secret: string): Promise<{ payload: T; tokenHash: string } | null> {
+    async verifyEncryptedHashTokenPair<T>(encryptedToken: string, secret: string): Promise<IVerifyEncryptedHashTokenPairReturn<T>> {
         const tokenHash = crypto
             .createHash('sha256')
             .update(encryptedToken)
@@ -178,9 +222,39 @@ export class AuthHelper extends BaseRepository {
                 secret,
             });
 
-            return { payload, tokenHash };
+            return { payload, tokenHash, error: null };
         } catch (e) {
-            return null;
+            return { payload: null, tokenHash: null, error: e };
         }
+    }
+
+    async verifySudoPassword(password: string, reply: FastifyReply, currentUser: AuthUser) {
+        const account = await this.getRepository(Account).findOne({
+            where: { id: currentUser.accountId, verifiedAt: Not(IsNull()) },
+            select: { id: true, password: true }
+        });
+        if (!account) return { verified: false };
+
+        const isPasswordValid = await bcrypt.compare(password, account.password);
+
+        if (!isPasswordValid) return { verified: false };
+
+        const sudoAccessToken = await this.myJwtService.getSudoAccessToken(account.id);
+
+        return reply
+            .setCookie(
+                Tokens.SUDO_ACCESS_TOKEN_COOKIE_NAME,
+                sudoAccessToken,
+                {
+                    secure: this.envService.NODE_ENV === 'production',
+                    httpOnly: true,
+                    signed: true,
+                    sameSite: this.envService.NODE_ENV === 'production' ? 'none' : 'lax',
+                    expires: new Date(Date.now() + (this.envService.SUDO_ACCESS_TOKEN_EXPIRATION_SEC * 1000)),
+                    path: '/',
+                }
+            )
+            .header('Content-Type', 'application/json')
+            .send({ verified: true })
     }
 }

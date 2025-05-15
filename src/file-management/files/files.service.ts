@@ -1,23 +1,20 @@
-import { Injectable, NotFoundException, Res } from '@nestjs/common';
+import { Injectable, InternalServerErrorException, NotFoundException, Res } from '@nestjs/common';
 import { CreateFileDto } from './dto/create-files.dto';
 import { InjectRepository } from '@nestjs/typeorm';
 import { File } from './entities/file.entity';
 import { In, Repository } from 'typeorm';
 import path from 'path';
-import fs from 'fs';
-import { fileSelectColumns } from './entities/file-select-cols.config';
-import { UpdateFileDto } from './dto/update-files.dto';
-import { QueryDto } from 'src/common/dto/query.dto';
-import { applySelectColumns } from 'src/utils/apply-select-cols';
-import paginatedData from 'src/utils/paginatedData';
+import { promises as fsPromises, createReadStream } from 'fs';
+import { getFileMetadata } from 'src/utils/getFileMetadata';
 import { FastifyReply } from 'fastify';
 import { EFileMimeType } from 'src/common/types/global.type';
-import { getFileMetadata } from 'src/utils/getFileMetadata';
+import { EnvService } from 'src/env/env.service';
 
 @Injectable()
 export class FilesService {
   constructor(
     @InjectRepository(File) private filesRepository: Repository<File>,
+    private readonly envService: EnvService,
   ) { }
 
   async upload(createFileDto: CreateFileDto) {
@@ -40,88 +37,61 @@ export class FilesService {
     }
   }
 
-  async findAll(queryDto: QueryDto) {
-    const queryBuilder = this.filesRepository.createQueryBuilder('file');
+  async findAllByIds(ids: string[], mimeType?: EFileMimeType | EFileMimeType[]) {
+    const mimeTypeArrayQuery = mimeType ? In(Array.isArray(mimeType) ? mimeType : [mimeType]) : undefined;
+    const mimeTypeArrayQueryObject = mimeTypeArrayQuery ? { mimeType: mimeTypeArrayQuery } : {};
 
-    queryBuilder
-      .orderBy('file.createdAt', 'DESC')
-      .skip(queryDto.skip)
-      .take(queryDto.take)
-
-    applySelectColumns(queryBuilder, fileSelectColumns, 'file');
-
-    return paginatedData(queryDto, queryBuilder);
-  }
-
-  async findAllByIds(ids: string[], mimeType?: EFileMimeType) {
     return await this.filesRepository.find({
       where: [
-        { id: In(ids), mimeType: mimeType },
-        { url: In(ids), mimeType: mimeType }
-      ]
+        { id: In(ids), ...mimeTypeArrayQueryObject },
+        { url: In(ids), ...mimeTypeArrayQueryObject }
+      ],
+      select: { id: true }
     })
   }
 
-  async findOne(id: string) {
-    const existingFile = await this.filesRepository.findOne({
-      where: [
-        { id },
-        { url: id }
-      ],
-    });
-    if (!existingFile) throw new NotFoundException('File not found');
-
-    return existingFile
-  }
-
-  async serveFile(filename: string, @Res() res: FastifyReply) {
+  async serveFile(filename: string, reply: FastifyReply) {
     const filePath = path.join(process.cwd(), 'public', filename);
 
-    fs.stat(filePath, (err, stats) => {
-      if (err) {
-        if (err.code === 'ENOENT') {
-          throw new NotFoundException('File not found');
-        } else {
-          throw new Error(err.message);
-        }
+    try {
+      // 1. Check that the file exists and is readable
+      const stats = await fsPromises.stat(filePath);
+      if (!stats.isFile()) {
+        throw new NotFoundException('File not found');
       }
 
-      const fileExt = path.extname(filename).substring(1);
-      const contentTypeFormat = fileExt === 'pdf' ? 'application/pdf' : `image/${fileExt}`;
+      // 2. Determine content-type
+      const ext = path.extname(filename).substring(1).toLowerCase();
+      const contentType = ext === 'pdf'
+        ? 'application/pdf'
+        : `image/${ext}`;
 
-      // Set headers
-      res.header('Content-Type', contentTypeFormat);
-      res.header('Content-Length', stats.size);
-      res.header('Content-Disposition', 'inline');
+      // 3. Set headers
+      reply
+        .header('Content-Type', contentType)
+        .header('Content-Length', stats.size.toString())
+        .header('Content-Disposition', 'inline')
+        .header('Access-Control-Allow-Origin', this.envService.CLIENT_URL)
+        .header('Cross-Origin-Resource-Policy', 'cross-origin');
 
-      // Stream the file directly to the response
-      const readStream = fs.createReadStream(filePath);
-      res.send(readStream);
-    });
-  }
+      // 4. Stream the file
+      const stream = createReadStream(filePath);
+      stream.on('error', err => {
+        // Handle streaming errors
+        reply.status(500).send('Error reading file');
+      });
+      reply.send(stream);
 
-  async update(id: string, updateFileDto: UpdateFileDto) {
-    const existing = await this.findOne(id);
-
-    // update file name only
-    existing.name = updateFileDto.name;
-
-    const savedFile = await this.filesRepository.save(existing);
-
-    return {
-      message: 'File updated',
-      file: {
-        url: savedFile.url,
-        id: savedFile.id
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        // File does not exist
+        reply.status(404).send('File not found');
+      } else if (err instanceof NotFoundException) {
+        reply.status(404).send(err.message);
+      } else {
+        // Other errors (permissions, etc.)
+        reply.status(500).send('Internal server error');
       }
-    }
-  }
-
-  async remove(id: string) {
-    const existing = await this.findOne(id);
-    await this.filesRepository.remove(existing);
-    return {
-      message: 'File deleted successfully'
     }
   }
 }
