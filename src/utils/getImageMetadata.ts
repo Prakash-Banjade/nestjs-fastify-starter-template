@@ -1,4 +1,4 @@
-import path from 'path';
+import * as path from 'path';
 import fs from 'fs';
 import { MemoryStoredFile } from 'nestjs-form-data';
 import sharp from 'sharp';
@@ -48,29 +48,8 @@ export async function getImageMetadata(memoryStoredFile: MemoryStoredFile) {
         if (err) {
             console.error('Error saving file:', err);
             throw err;
-        } else {
-            console.log('File saved successfully:', filePath);
         }
     });
-
-    // Generate and save the thumbnail in WebP format
-    const thumbnailBuffer = await sharp(memoryStoredFile.buffer)
-        .blur(1)
-        .resize(10)
-        .webp()
-        .toBuffer();
-    const thumbnailFilePath = path.join(uploadDir, fileNameSlug + '-thumbnail.webp');
-
-    fs.writeFile(thumbnailFilePath, thumbnailBuffer, (err) => {
-        if (err) {
-            console.error('Error saving file:', err);
-            throw err;
-        } else {
-            console.log('Thumbnail saved successfully:', thumbnailFilePath);
-        }
-    });
-
-    const thumbnailUrl = process.env.BACKEND_URL + '/api/upload/images/get-image/' + fileNameSlug + '-thumbnail.webp';
 
     return metadata;
 }

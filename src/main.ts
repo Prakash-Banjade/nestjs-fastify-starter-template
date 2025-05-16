@@ -9,6 +9,7 @@ import { ConfigService } from '@nestjs/config';
 import fastifyHelmet from '@fastify/helmet';
 import fastifyCsrfProtection from '@fastify/csrf-protection';
 import fastifyCors from '@fastify/cors';
+import fastifyMultipart from '@fastify/multipart';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestFastifyApplication>(
@@ -24,6 +25,7 @@ async function bootstrap() {
 
   app.register(fastifyHelmet);
   app.register(fastifyCsrfProtection, { cookieOpts: { signed: true } });
+  app.register(fastifyMultipart);
 
   app.register(fastifyCors, {
     credentials: true,
